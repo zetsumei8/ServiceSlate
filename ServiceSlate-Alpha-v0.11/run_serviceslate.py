@@ -21,9 +21,9 @@ PORT_FILE = DATA_DIR / ".serviceslate-port"
 LOCK_FILE = DATA_DIR / ".serviceslate-running"
 
 
-def _probe(port: int, host: str = LOCAL_HOST) -> bool:
+def _probe(port: int, host: str = LOCAL_HOST, scheme: str = "http") -> bool:
     try:
-        with urllib.request.urlopen(f"http://{host}:{port}/api/setup/status", timeout=0.6) as response:
+        with urllib.request.urlopen(f"{scheme}://{host}:{port}/api/setup/status", timeout=0.6) as response:
             return 200 <= response.status < 500
     except (OSError, urllib.error.URLError, ValueError):
         return False
@@ -48,10 +48,10 @@ def _choose_port() -> int:
     raise RuntimeError("ServiceSlate could not find an available local connection. Close another copy and try again.")
 
 
-def _open_browser(port: int) -> None:
-    url = f"http://{LOCAL_HOST}:{port}"
+def _open_browser(port: int, scheme: str = "http") -> None:
+    url = f"{scheme}://{LOCAL_HOST}:{port}"
     for _ in range(40):
-        if _probe(port):
+        if _probe(port, scheme=scheme):
             webbrowser.open(url)
             return
         time.sleep(0.15)
@@ -83,6 +83,11 @@ def main() -> None:
         return
 
     bind_host = "0.0.0.0" if role == "host" else LOCAL_HOST
+    tls_cert = os.environ.get("SERVICESLATE_LAN_TLS_CERT", "").strip()
+    tls_key = os.environ.get("SERVICESLATE_LAN_TLS_KEY", "").strip()
+    if role == "host" and (not tls_cert or not tls_key):
+        raise RuntimeError("Office Host mode requires SERVICESLATE_LAN_TLS_CERT and SERVICESLATE_LAN_TLS_KEY so staff sessions are protected by HTTPS.")
+    scheme = "https" if role == "host" else "http"
     os.environ["SERVICESLATE_LAN_ROLE"] = role
     existing = _read_existing_port()
     if existing:
@@ -105,9 +110,9 @@ def main() -> None:
     os.environ["SERVICESLATE_PORT"] = str(port)
     PORT_FILE.write_text(str(port), encoding="utf-8")
     LOCK_FILE.write_text(json.dumps({"port": port, "started": time.time()}), encoding="utf-8")
-    threading.Thread(target=_open_browser, args=(port,), daemon=True).start()
+    threading.Thread(target=_open_browser, args=(port, scheme), daemon=True).start()
     try:
-        uvicorn.run("serviceslate.app:app", host=bind_host, port=port, reload=False, log_level="warning")
+        uvicorn.run("serviceslate.app:app", host=bind_host, port=port, reload=False, log_level="warning", ssl_certfile=tls_cert or None, ssl_keyfile=tls_key or None)
     finally:
         try:
             if PORT_FILE.exists() and PORT_FILE.read_text(encoding="utf-8").strip() == str(port):

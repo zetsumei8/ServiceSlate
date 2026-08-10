@@ -240,6 +240,13 @@ def create_backup(request: Request):
     u = require_user(request)
     if u["role"] not in ("ADMIN", "MANAGER", "COORDINATOR"):
         raise HTTPException(403, "Backup permission required")
+    # A physical database archive is only safe when this installation contains
+    # one live company.  Shared-host recovery remains an operator task; users
+    # can use the existing organization-scoped export instead.
+    from .cloud_connectors import organization_database_backup_is_safe_for_offsite
+    allowed, reason = organization_database_backup_is_safe_for_offsite(u["organization_id"])
+    if not allowed:
+        raise HTTPException(409, reason)
     path = create_backup_archive()
     mirrors = []
     try:
@@ -390,7 +397,9 @@ def workspace_readiness(request: Request):
         services = conn.execute("SELECT COUNT(*) FROM service_catalog WHERE organization_id=? AND active=1", (org_id,)).fetchone()[0]
         assets_table = "pets" if profile == "grooming" else "equipment"
         assets = conn.execute(f"SELECT COUNT(*) FROM {assets_table} WHERE organization_id=?", (org_id,)).fetchone()[0]
-    backups = list(BACKUPS_DIR.glob("ServiceSlate-Backup-*.zip"))
+    from .cloud_connectors import organization_database_backup_is_safe_for_offsite
+    backup_allowed, _ = organization_database_backup_is_safe_for_offsite(org_id)
+    backups = list(BACKUPS_DIR.glob("ServiceSlate-Backup-*.zip")) if backup_allowed else []
     items = [
         {"id": "customers", "label": "Add your first customer", "detail": "Start building a trusted service history.", "complete": customers > 0, "action": "customers"},
         {"id": "team", "label": "Add your team", "detail": "Give each person only the access they need.", "complete": team > 1, "action": "team"},
@@ -589,6 +598,8 @@ class JobUpdate(BaseModel):
 @app.patch("/api/jobs/{job_id}")
 def update_job(job_id:str,p:JobUpdate,request:Request):
     u=require_user(request); org=u["organization_id"]
+    if u["role"] not in ("ADMIN", "MANAGER", "COORDINATOR"):
+        raise HTTPException(403, "Office permission required to update jobs")
     with connect() as conn:
         row=conn.execute("SELECT * FROM jobs WHERE id=? AND organization_id=?",(job_id,org)).fetchone()
         if not row: raise HTTPException(404,"Job not found")
@@ -840,6 +851,14 @@ def submit_work(job_id:str,p:Submission,request:Request):
         def do():
             j=conn.execute("SELECT * FROM jobs WHERE id=? AND organization_id=?",(job_id,org)).fetchone()
             if not j: raise HTTPException(404,"Job not found")
+            if u["role"] == "TECHNICIAN":
+                assignment = conn.execute(
+                    """SELECT 1 FROM visits WHERE organization_id=? AND job_id=?
+                       AND (technician_user_id=? OR helper_user_id=?) LIMIT 1""",
+                    (org, job_id, u["id"], u["id"]),
+                ).fetchone()
+                if not assignment:
+                    raise HTTPException(403, "You can submit work only for a job assigned to you")
             active = conn.execute("SELECT id,state FROM work_submissions WHERE job_id=? AND technician_user_id=? AND state IN ('SUBMITTED','NEEDS_CORRECTION') ORDER BY created_at DESC LIMIT 1", (job_id,u["id"])).fetchone()
             if active:
                 return {"submission_id": active["id"], "state": active["state"], "already_exists": True}
@@ -856,6 +875,8 @@ def submit_work(job_id:str,p:Submission,request:Request):
 @app.get("/api/reviews")
 def reviews(request:Request):
     u=require_user(request); org=u["organization_id"]
+    if u["role"] not in ("ADMIN", "MANAGER", "COORDINATOR"):
+        raise HTTPException(403, "Review permission required")
     with connect() as conn:
         rows=conn.execute("""SELECT w.*,j.job_number,j.description,c.name customer_name,COALESCE(w.performed_by_text,uu.name) technician_name FROM work_submissions w JOIN jobs j ON j.id=w.job_id JOIN customers c ON c.id=j.customer_id JOIN users uu ON uu.id=w.technician_user_id WHERE w.organization_id=? AND w.state IN ('SUBMITTED','NEEDS_CORRECTION') ORDER BY w.submitted_at""",(org,)).fetchall()
     out=[]

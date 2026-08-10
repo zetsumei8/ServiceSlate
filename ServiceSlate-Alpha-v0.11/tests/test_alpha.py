@@ -73,8 +73,8 @@ def test_schedule_command_is_idempotent_and_rejects_missing_second_tech():
             "job_id": two["id"],
             "technician_user_id": "u_chris",
             "helper_user_id": None,
-            "start_at": "2026-08-10T15:00:00+00:00",
-            "end_at": "2026-08-10T19:00:00+00:00",
+            "start_at": "2030-08-10T15:00:00+00:00",
+            "end_at": "2030-08-10T19:00:00+00:00",
         }
         bad = client.post("/api/schedule", json=payload)
         assert bad.status_code == 400
@@ -96,18 +96,50 @@ def test_backup_is_point_and_click_api():
         assert Path(result["path"]).exists()
 
 
+def test_shared_host_blocks_tenant_access_to_physical_backups():
+    from serviceslate.db import new_id, utcnow
+    with connect() as conn:
+        now = utcnow()
+        for name in ("Live One", "Live Two"):
+            conn.execute(
+                "INSERT INTO organizations(id,name,profile,is_demo,created_at) VALUES(?,?,?,?,?)",
+                (new_id("org"), name, "automotive_equipment", 0, now),
+            )
+    with TestClient(app) as client:
+        login(client, "coordinator@demo.example.com")
+        assert client.post("/api/backups").status_code == 409
+        assert client.get("/api/system/status").json()["backups"] == []
+
+
+def test_job_review_and_submission_permissions_are_enforced():
+    submission = {
+        "command_id": "unassigned-submit", "finding": "Test", "correction": "Test",
+        "verification": "Test", "outcome": "COMPLETED", "measurements": [], "parts": [], "recommendations": [],
+    }
+    with TestClient(app) as client:
+        login(client, "tech.chris@demo.example.com")
+        assigned_job_id = client.get("/api/tech/today").json()["visits"][0]["job_id"]
+        job = client.get(f"/api/jobs/{assigned_job_id}/detail").json()["job"]
+        assert client.patch(f"/api/jobs/{assigned_job_id}", json={"version": job["version"], "status": "IN_PROGRESS"}).status_code == 403
+        assert client.post("/api/jobs/j_new/submit-work", json=submission).status_code == 403
+        assert client.get("/api/reviews").status_code == 403
+        client.post("/api/logout")
+        login(client, "coordinator@demo.example.com")
+        assert client.patch(f"/api/jobs/{assigned_job_id}", json={"version": job["version"], "status": "IN_PROGRESS"}).status_code == 200
+
+
 def test_partial_two_person_window_releases_helper_for_later_work():
     with TestClient(app) as client:
         login(client, "coordinator@demo.example.com")
         first = client.post("/api/schedule", json={
             "command_id": "partial-crew-1", "job_id": "j_two", "technician_user_id": "u_chris",
-            "helper_user_id": "u_jordan", "start_at": "2026-08-10T08:00:00-07:00", "end_at": "2026-08-10T12:00:00-07:00",
+            "helper_user_id": "u_jordan", "start_at": "2030-08-10T08:00:00-07:00", "end_at": "2030-08-10T12:00:00-07:00",
         })
         assert first.status_code == 200
-        assert first.json()["helper_end_at"] == "2026-08-10T09:00:00-07:00"
+        assert first.json()["helper_end_at"] == "2030-08-10T09:00:00-07:00"
         second = client.post("/api/schedule", json={
             "command_id": "partial-crew-2", "job_id": "j_unsched", "technician_user_id": "u_jordan",
-            "helper_user_id": None, "start_at": "2026-08-10T09:00:00-07:00", "end_at": "2026-08-10T10:30:00-07:00",
+            "helper_user_id": None, "start_at": "2030-08-10T09:00:00-07:00", "end_at": "2030-08-10T10:30:00-07:00",
         })
         assert second.status_code == 200
 
@@ -385,6 +417,13 @@ def test_grooming_completion_creates_rebooking_obligation():
         assert any(x["pet_name"] == "Luna" and x["service_name"] == "Full Groom" for x in rebooking)
 
 
+def test_only_assigned_groomer_or_office_can_complete_appointment():
+    with TestClient(app) as client:
+        login(client, "reception@demo.example.com")
+        denied = client.post("/api/grooming/appointments/ga1/complete", json={"command_id": "groom-denied", "checkout_note": "Nope"})
+        assert denied.status_code == 403
+
+
 def test_legacy_work_history_import_preserves_source_and_becomes_searchable_memory():
     with TestClient(app) as client:
         login(client, "coordinator@demo.example.com")
@@ -574,6 +613,8 @@ def test_secure_customer_estimate_link_records_exact_revision_once():
             assert first.status_code == 200
             assert first.json()["state"] == "APPROVED"
             assert second.json() == first.json()
+            replay = public.post(f"/api/public/portal/{token}/decision", json={**decision, "command_id": "portal-replay-command"})
+            assert replay.status_code == 409
 
         detail = office.get(f"/api/estimates/{estimate['id']}").json()
         assert detail["estimate"]["status"] == "APPROVED"
@@ -822,6 +863,47 @@ def test_integration_catalog_exposes_open_first_and_paid_optional_adapters():
         assert rows["CALDAV"]["open_source"] is True
         assert rows["TWILIO_SMS"]["mode"] == "paid_adapter"
         assert rows["MOBILE_SMS"]["mode"] == "handoff"
+
+
+def test_outbound_http_rejects_private_destinations_and_twilio_fails_closed(monkeypatch):
+    from serviceslate import integrations as integration_module
+    from serviceslate.db import new_id, utcnow
+
+    with pytest.raises(RuntimeError, match="public internet"):
+        integration_module._http_request("http://127.0.0.1:8080")
+    with connect() as conn:
+        now = utcnow()
+        conn.execute(
+            "INSERT INTO integration_deliveries(id,organization_id,provider,external_reference,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            (new_id("delivery"), "org_auto_demo", "TWILIO_SMS", "SM-security-test", "SENT", now, now),
+        )
+    monkeypatch.setattr(integration_module.VAULT, "get_provider", lambda *args: {})
+    with TestClient(app) as client:
+        response = client.post("/api/integrations/twilio/status", data={"MessageSid": "SM-security-test", "MessageStatus": "delivered"})
+        assert response.status_code == 403
+
+
+def test_import_and_restore_limits_reject_oversized_payloads(monkeypatch):
+    from serviceslate import features
+    monkeypatch.setattr(features, "MAX_UPLOAD_BYTES", 4)
+    monkeypatch.setattr(features, "MAX_RESTORE_BYTES", 4)
+    with TestClient(app) as client:
+        login(client, "coordinator@demo.example.com")
+        csv_result = client.post("/api/import/customers/preview", files={"file": ("large.csv", b"12345", "text/csv")})
+        assert csv_result.status_code == 413
+        client.post("/api/logout")
+        login(client, "manager@demo.example.com")
+        restore_result = client.post("/api/restore", files={"file": ("large.zip", b"12345", "application/zip")})
+        assert restore_result.status_code == 413
+
+
+def test_office_host_requires_tls_material(monkeypatch):
+    import run_serviceslate
+    monkeypatch.setenv("SERVICESLATE_LAN_ROLE", "host")
+    monkeypatch.delenv("SERVICESLATE_LAN_TLS_CERT", raising=False)
+    monkeypatch.delenv("SERVICESLATE_LAN_TLS_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="requires .*HTTPS"):
+        run_serviceslate.main()
 
 
 def test_integration_configuration_keeps_secret_out_of_sqlite(monkeypatch):

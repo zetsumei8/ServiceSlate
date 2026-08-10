@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import ipaddress
 import hashlib
 import hmac
 import json
@@ -14,6 +15,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+import socket
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -343,9 +345,23 @@ def _provider_row(org: str, provider: str) -> tuple[dict[str, Any], dict[str, st
 
 def _http_request(url: str, *, method: str = "GET", data: bytes | None = None,
                   headers: dict[str, str] | None = None, timeout: float = 12) -> tuple[int, bytes, dict[str, str]]:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise RuntimeError("Outbound URL must be an absolute HTTP(S) address without embedded credentials")
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)}
+    except OSError as exc:
+        raise RuntimeError("Outbound URL host could not be resolved") from exc
+    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+        raise RuntimeError("Outbound URL must resolve only to public internet addresses")
     req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as res:  # noqa: S310 - configured integration URL
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+        opener = urllib.request.build_opener(_NoRedirect())
+        opener.addheaders = []
+        with opener.open(req, timeout=timeout) as res:  # noqa: S310 - validated configured integration URL
             return res.status, res.read(), dict(res.headers.items())
     except urllib.error.HTTPError as exc:
         body = exc.read()[:1000]
@@ -839,12 +855,15 @@ async def twilio_status(request: Request):
     if not delivery: raise HTTPException(404,"Twilio message not found")
     secrets_map=VAULT.get_provider(delivery["organization_id"],"TWILIO_SMS"); token=secrets_map.get("auth_token","")
     signature=request.headers.get("X-Twilio-Signature","")
-    if token and signature:
-        with connect() as conn:
-            orgrow=conn.execute("SELECT public_base_url FROM organizations WHERE id=?",(delivery["organization_id"],)).fetchone()
-        url=(str(orgrow["public_base_url"] or "").rstrip("/")+"/api/integrations/twilio/status") if orgrow and orgrow["public_base_url"] else str(request.url)
-        expected=_twilio_signature(url,params,token)
-        if not hmac.compare_digest(signature,expected): raise HTTPException(403,"Twilio signature did not verify")
+    if not token or not signature:
+        raise HTTPException(403, "Twilio signature verification is required")
+    with connect() as conn:
+        orgrow=conn.execute("SELECT public_base_url FROM organizations WHERE id=?",(delivery["organization_id"],)).fetchone()
+    if not orgrow or not str(orgrow["public_base_url"] or "").startswith("https://"):
+        raise HTTPException(403, "Twilio callback requires the configured HTTPS public address")
+    url=str(orgrow["public_base_url"]).rstrip("/")+"/api/integrations/twilio/status"
+    expected=_twilio_signature(url,params,token)
+    if not hmac.compare_digest(signature,expected): raise HTTPException(403,"Twilio signature did not verify")
     mapped="DELIVERED" if status=="delivered" else "FAILED" if status in {"failed","undelivered"} else "SENT"
     now=utcnow()
     with connect() as conn:

@@ -20,6 +20,25 @@ from .db import BACKUPS_DIR, DB_PATH, FILES_DIR, DATA_DIR, audit, command_once, 
 
 router = APIRouter(prefix="/api")
 
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_RESTORE_BYTES = 1024 * 1024 * 1024
+MAX_RESTORE_MEMBERS = 20_000
+MAX_RESTORE_EXPANDED_BYTES = 250 * 1024 * 1024
+MAX_CSV_ROWS = 10_000
+
+
+async def read_upload_limited(file: UploadFile, limit: int | None = None) -> bytes:
+    """Read an uploaded file without allowing an unbounded request body."""
+    limit = MAX_UPLOAD_BYTES if limit is None else limit
+    chunks: list[bytes] = []
+    size = 0
+    while chunk := await file.read(1024 * 1024):
+        size += len(chunk)
+        if size > limit:
+            raise HTTPException(413, f"Upload is larger than the {limit // (1024 * 1024)} MB limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
 
 def user_for(request: Request) -> dict[str, Any]:
     uid = request.session.get("user_id")
@@ -1458,6 +1477,16 @@ def _portal_record(conn: sqlite3.Connection, token: str) -> dict[str, Any]:
     raise HTTPException(404, "This secure link is not supported")
 
 
+def _consume_portal_link(conn: sqlite3.Connection, link_id: str, now: str) -> None:
+    """Claim a customer-action link exactly once before changing business state."""
+    claimed = conn.execute(
+        "UPDATE portal_links SET consumed_at=? WHERE id=? AND consumed_at IS NULL",
+        (now, link_id),
+    )
+    if claimed.rowcount != 1:
+        raise HTTPException(409, "This secure link has already been used")
+
+
 @router.get("/public/portal/{token}")
 def public_portal(token: str):
     with connect() as conn:
@@ -1499,6 +1528,14 @@ def public_portal_decision(token: str, p: PublicPortalDecision):
     with connect() as conn:
         row = _portal_record(conn, token)
         org = row["organization_id"]
+        receipt = conn.execute(
+            "SELECT result_json FROM command_receipts WHERE command_id=? AND organization_id=?",
+            (p.command_id, org),
+        ).fetchone()
+        if receipt:
+            return json.loads(receipt["result_json"])
+        if row["consumed_at"]:
+            raise HTTPException(409, "This secure link has already been used")
         if row["portal_kind"] == "SERVICE_DAY_CONFIRMATION":
             def service_do():
                 current = conn.execute("SELECT * FROM service_day_confirmations WHERE id=? AND organization_id=?", (row["confirmation_id"], org)).fetchone()
@@ -1508,7 +1545,10 @@ def public_portal_decision(token: str, p: PublicPortalDecision):
                     raise HTTPException(409, "The scheduled date changed. Please use the latest confirmation message.")
                 if current["status"] == "CONFIRMED" and p.action == "confirm":
                     return {"state": "CONFIRMED", "already_recorded": True}
+                if p.action not in {"confirm", "request_change"}:
+                    raise HTTPException(400, "Choose confirm or request a different day")
                 now = utcnow(); name = (p.signer_name or "Customer contact").strip() or "Customer contact"
+                _consume_portal_link(conn, row["id"], now)
                 if p.action == "confirm":
                     state = "CONFIRMED"
                     conn.execute("UPDATE service_day_confirmations SET status=?,confirmed_by_name=?,confirmed_at=?,updated_at=? WHERE id=?", (state, name, now, now, current["id"]))
@@ -1518,9 +1558,6 @@ def public_portal_decision(token: str, p: PublicPortalDecision):
                     conn.execute("UPDATE service_day_confirmations SET status=?,change_request_note=?,updated_at=? WHERE id=?", (state, p.note, now, current["id"]))
                     conn.execute("UPDATE jobs SET next_action='Contact customer to coordinate a new service day',version=version+1,updated_at=? WHERE id=?", (now, current["job_id"]))
                     summary = f"Customer requested a different service day from {current['scheduled_date']}"
-                else:
-                    raise HTTPException(400, "Choose confirm or request a different day")
-                conn.execute("UPDATE portal_links SET consumed_at=? WHERE id=?", (now, row["id"]))
                 audit(conn, org, None, "job", current["job_id"], f"CUSTOMER_SERVICE_DAY_{state}", summary)
                 return {"state": state}
             return command_once(conn, org, p.command_id, service_do)
@@ -1536,7 +1573,10 @@ def public_portal_decision(token: str, p: PublicPortalDecision):
             signer = (p.signer_name or "").strip()
             if not signer:
                 raise HTTPException(400, "Enter the name of the person making this decision")
+            if p.action not in {"approve", "decline"}:
+                raise HTTPException(400, "Choose approve or decline")
             now = utcnow()
+            _consume_portal_link(conn, row["id"], now)
             if p.action == "approve":
                 state = "APPROVED"
                 scope = f"Approved {current['estimate_number']} revision {current['revision']} for {current['total_cents']/100:.2f} {current['currency']}"
@@ -1550,10 +1590,7 @@ def public_portal_decision(token: str, p: PublicPortalDecision):
                     audit(conn,org,None,"job",current["job_id"],"ESTIMATE_APPROVED",scope)
             elif p.action == "decline":
                 state = "DECLINED"
-            else:
-                raise HTTPException(400, "Choose approve or decline")
             conn.execute("UPDATE estimates SET status=?,decided_at=?,updated_at=? WHERE id=?", (state,now,now,current["id"]))
-            conn.execute("UPDATE portal_links SET consumed_at=? WHERE id=?", (now,row["id"]))
             audit(conn,org,None,"estimate",current["id"],f"CUSTOMER_{state}",f"{signer} {state.lower()} {current['estimate_number']} revision {current['revision']} through secure link")
             return {"state": state}
         return command_once(conn, org, p.command_id, estimate_do)
@@ -1982,7 +2019,9 @@ def system_status(request: Request):
     u = user_for(request)
     org = u["organization_id"]
     BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
-    backups = sorted(BACKUPS_DIR.glob("ServiceSlate-Backup-*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
+    from .cloud_connectors import organization_database_backup_is_safe_for_offsite
+    backup_allowed, _ = organization_database_backup_is_safe_for_offsite(org)
+    backups = sorted(BACKUPS_DIR.glob("ServiceSlate-Backup-*.zip"), key=lambda p: p.stat().st_mtime, reverse=True) if backup_allowed else []
     usage = shutil.disk_usage(DATA_DIR)
     with connect() as conn:
         schema = conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
@@ -2007,6 +2046,10 @@ def system_status(request: Request):
 def download_backup(filename: str, request: Request):
     u = user_for(request)
     require_roles(u, "ADMIN", "MANAGER", "COORDINATOR")
+    from .cloud_connectors import organization_database_backup_is_safe_for_offsite
+    allowed, reason = organization_database_backup_is_safe_for_offsite(u["organization_id"])
+    if not allowed:
+        raise HTTPException(409, reason)
     if Path(filename).name != filename or not filename.startswith("ServiceSlate-Backup-") or not filename.endswith(".zip"):
         raise HTTPException(400, "Backup filename is not valid")
     path = BACKUPS_DIR / filename
@@ -2019,6 +2062,10 @@ def download_backup(filename: str, request: Request):
 def verify_backup(filename: str, request: Request):
     u = user_for(request)
     require_roles(u, "ADMIN", "MANAGER", "COORDINATOR")
+    from .cloud_connectors import organization_database_backup_is_safe_for_offsite
+    allowed, reason = organization_database_backup_is_safe_for_offsite(u["organization_id"])
+    if not allowed:
+        raise HTTPException(409, reason)
     if Path(filename).name != filename or not filename.startswith("ServiceSlate-Backup-") or not filename.endswith(".zip"):
         raise HTTPException(400, "Backup filename is not valid")
     path = BACKUPS_DIR / filename
@@ -2053,9 +2100,7 @@ async def restore_backup(request: Request, file: UploadFile = File(...)):
     require_roles(u, "ADMIN", "MANAGER")
     if database_backend() == "postgresql":
         raise HTTPException(409, "Hosted PostgreSQL restore uses the managed restore runbook so active company data is not replaced from a browser request.")
-    raw = await file.read()
-    if len(raw) > 1024 * 1024 * 1024:
-        raise HTTPException(413, "Backup is larger than the 1 GB Alpha restore limit")
+    raw = await read_upload_limited(file, MAX_RESTORE_BYTES)
     temp_dir = DATA_DIR / f".restore-{new_id('tmp')}"
     temp_dir.mkdir(parents=True, exist_ok=False)
     zip_path = temp_dir / "restore.zip"
@@ -2067,10 +2112,17 @@ async def restore_backup(request: Request, file: UploadFile = File(...)):
             with zipfile.ZipFile(zip_path) as zf:
                 if "serviceslate.db" not in zf.namelist():
                     raise HTTPException(400, "That file is not a ServiceSlate backup")
-                bad = zf.testzip()
-                if bad:
-                    raise HTTPException(400, f"Backup contains a damaged file: {bad}")
-                restored_db.write_bytes(zf.read("serviceslate.db"))
+                members = zf.infolist()
+                if len(members) > MAX_RESTORE_MEMBERS:
+                    raise HTTPException(400, "Backup contains too many files")
+                total_size = sum(member.file_size for member in members)
+                if total_size > MAX_RESTORE_EXPANDED_BYTES:
+                    raise HTTPException(400, "Backup expands beyond the restore safety limit")
+                database_member = zf.getinfo("serviceslate.db")
+                if database_member.file_size > MAX_RESTORE_EXPANDED_BYTES:
+                    raise HTTPException(400, "Backup database is too large")
+                with zf.open(database_member) as source, restored_db.open("wb") as destination:
+                    shutil.copyfileobj(source, destination, 1024 * 1024)
                 for member in zf.infolist():
                     if not member.filename.startswith("files/") or member.is_dir():
                         continue
@@ -2079,7 +2131,8 @@ async def restore_backup(request: Request, file: UploadFile = File(...)):
                         raise HTTPException(400, "Backup contains an unsafe file path")
                     target = restored_files / rel
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(zf.read(member))
+                    with zf.open(member) as source, target.open("wb") as destination:
+                        shutil.copyfileobj(source, destination, 1024 * 1024)
         except zipfile.BadZipFile as exc:
             raise HTTPException(400, "Backup ZIP is damaged") from exc
         check = sqlite3.connect(restored_db)
@@ -2157,13 +2210,15 @@ async def import_customers_preview(request: Request, file: UploadFile = File(...
     u = user_for(request)
     require_roles(u, "ADMIN", "MANAGER", "COORDINATOR")
     org = u["organization_id"]
-    raw = await file.read()
+    raw = await read_upload_limited(file)
     try:
         text = raw.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise HTTPException(400, "Use a UTF-8 CSV file") from exc
     reader = csv.DictReader(io.StringIO(text))
     rows = list(reader)
+    if len(rows) > MAX_CSV_ROWS:
+        raise HTTPException(400, f"CSV contains more than the {MAX_CSV_ROWS:,} row import limit")
     if not rows:
         raise HTTPException(400, "No customer rows were found")
     bid = new_id("import")
@@ -2216,13 +2271,15 @@ async def import_work_history_preview(request: Request, file: UploadFile = File(
     require_automotive(u)
     require_roles(u, "ADMIN", "MANAGER", "COORDINATOR")
     org = u["organization_id"]
-    raw = await file.read()
+    raw = await read_upload_limited(file)
     try:
         text = raw.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise HTTPException(400, "Use a UTF-8 CSV file") from exc
     reader = csv.DictReader(io.StringIO(text))
     source_rows = list(reader)
+    if len(source_rows) > MAX_CSV_ROWS:
+        raise HTTPException(400, f"CSV contains more than the {MAX_CSV_ROWS:,} row import limit")
     if not source_rows:
         raise HTTPException(400, "No work-history rows were found")
     bid = new_id("import")
@@ -2643,6 +2700,8 @@ def complete_grooming(appointment_id: str, p: GroomComplete, request: Request):
             appt = conn.execute("SELECT * FROM grooming_appointments WHERE id=? AND organization_id=?", (appointment_id, org)).fetchone()
             if not appt:
                 raise HTTPException(404, "Appointment not found")
+            if u["role"] not in ("ADMIN", "MANAGER", "COORDINATOR") and not (u["role"] == "GROOMER" and appt["groomer_user_id"] == u["id"]):
+                raise HTTPException(403, "Only the assigned groomer or office staff can complete this appointment")
             now = utcnow()
             conn.execute("UPDATE grooming_appointments SET status='COMPLETED',checkout_note=?,completed_at=?,updated_at=? WHERE id=?", (p.checkout_note, now, now, appointment_id))
             weeks = p.rebook_weeks

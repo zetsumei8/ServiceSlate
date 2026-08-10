@@ -62,16 +62,20 @@ def lan_status(request: Request) -> dict[str, Any]:
             (user["organization_id"], user["id"]),
         ).fetchone()[0]
     hostname = socket.gethostname().strip()
+    tls_ready = bool(os.environ.get("SERVICESLATE_LAN_TLS_CERT") and os.environ.get("SERVICESLATE_LAN_TLS_KEY"))
+    sharing_active = _lan_mode() == "host" and tls_ready
+    scheme = "https" if sharing_active else "http"
     return {
         "mode": _lan_mode(),
-        "sharing_active": _lan_mode() == "host",
-        "lan_url": f"http://{hostname}:{port}" if hostname else (f"http://{ip}:{port}" if ip else None),
-        "lan_ip_url": f"http://{ip}:{port}" if ip else None,
+        "sharing_active": sharing_active,
+        "lan_url": f"{scheme}://{hostname}:{port}" if hostname else (f"{scheme}://{ip}:{port}" if ip else None),
+        "lan_ip_url": f"{scheme}://{ip}:{port}" if ip else None,
         "hostname": hostname or None,
         "port": port,
         "online_users": online,
         "unread_messages": unread,
         "trusted_network_only": True,
+        "transport_security": "HTTPS" if sharing_active else "LOCAL_ONLY",
     }
 
 
