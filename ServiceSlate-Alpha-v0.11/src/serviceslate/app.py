@@ -51,7 +51,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="ServiceSlate", version="0.11.0", lifespan=lifespan)
+app = FastAPI(title="ServiceSlate", version="0.11.1", lifespan=lifespan)
 PRODUCTION_MODE = os.environ.get("SERVICESLATE_PRODUCTION_MODE", "0") == "1"
 
 class JsonLogFormatter(logging.Formatter):
