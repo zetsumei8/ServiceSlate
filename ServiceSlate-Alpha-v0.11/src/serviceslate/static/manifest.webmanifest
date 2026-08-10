@@ -1,0 +1,27 @@
+{
+  "name": "ServiceSlate",
+  "short_name": "ServiceSlate",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#101419",
+  "theme_color": "#101419",
+  "description": "Operational memory for service work \u2014 customers, scheduling, field paperwork, and permanent history.",
+  "icons": [
+    {
+      "src": "/static/brand-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/static/brand-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ],
+  "categories": [
+    "business",
+    "productivity"
+  ]
+}

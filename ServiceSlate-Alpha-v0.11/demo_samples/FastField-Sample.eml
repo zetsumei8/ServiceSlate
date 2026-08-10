@@ -1,0 +1,29 @@
+From: reports@fastfieldforms.com
+To: service@example.com
+Subject: FastField Work Order WO-DEMO-FF-01
+Message-ID: <serviceslate-demo-fastfield-01@example.local>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="===============0314172638470824996=="
+
+--===============0314172638470824996==
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: quoted-printable
+
+FastField work order submission. Structured work-order data is attached for S=
+erviceSlate review.
+
+--===============0314172638470824996==
+Content-Type: text/csv
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="FastField-WO-DEMO-FF-01.csv"
+MIME-Version: 1.0
+
+Y3VzdG9tZXIsd29ya19vcmRlcixkYXRlLHNlcmlhbCx0ZWNobmljaWFuLGNvbXBsYWludCxmaW5k
+aW5nLGNhdXNlLGNvcnJlY3Rpb24sdmVyaWZpY2F0aW9uCkZ1dHVyZSBGb3JkIG9mIENsb3ZpcyxX
+Ty1ERU1PLUZGLTAxLDIwMjYtMDgtMDcsREVNTy1DTDEwQS0wMDQsQ2hyaXMgUGF0ZWwsTGVmdCBw
+bGF0Zm9ybSBsb3dlcmluZyBmYXN0ZXIgdGhhbiByaWdodCxQbGF0Zm9ybXMgb3V0IG9mIHN5bmNo
+cm9uaXphdGlvbixBZGp1c3RtZW50IGRyaWZ0LFN5bmNocm9uaXplZCBib3RoIHBsYXRmb3JtcyBv
+biBmaW5hbCBsb2NrIGFuZCBhZGp1c3RlZCB2YWx2ZXMsQ3ljbGVkIGxpZnQgZml2ZSB0aW1lcyBh
+bmQgdmVyaWZpZWQgc3luY2hyb25pemVkIG9wZXJhdGlvbgo=
+
+--===============0314172638470824996==--

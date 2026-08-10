@@ -1,0 +1,37 @@
+name: ServiceSlate CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.13"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - run: uv sync --extra dev --extra security
+      - run: uv run ruff format --check src tests scripts
+      - run: uv run ruff check src tests scripts
+      - run: uv run basedpyright src
+      - run: uv run ty check src
+      - run: PYTHONPATH=src uv run pytest --cov=serviceslate --cov-branch --cov-report=term-missing
+      - run: uv run bandit -q -r src
+      - run: uv run pip-audit
+      - run: PYTHONPATH=src uv run python scripts/restore_drill.py
+      - run: uv build
+      - uses: actions/upload-artifact@v4
+        if: matrix.python-version == '3.13'
+        with:
+          name: python-packages
+          path: dist/*
